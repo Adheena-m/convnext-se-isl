@@ -12,6 +12,79 @@ import torch.nn.functional as F
 from timm.models.layers import trunc_normal_, DropPath
 from timm.models.registry import register_model
 
+
+class ChannelAttention(nn.Module):
+
+    def __init__(self, in_planes, ratio=16):
+
+        super(ChannelAttention, self).__init__()
+
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_planes, in_planes // ratio, 1, bias=True),
+            nn.ReLU(),
+            nn.Conv2d(in_planes // ratio, in_planes, 1, bias=True)
+        )
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+
+        out = avg_out + max_out
+
+        return self.sigmoid(out)
+
+
+class SpatialAttention(nn.Module):
+
+    def __init__(self, kernel_size=7):
+
+        super(SpatialAttention, self).__init__()
+
+        self.conv = nn.Conv2d(
+            2,
+            1,
+            kernel_size,
+            padding=kernel_size // 2,
+            bias=True
+        )
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+
+        x = torch.cat([avg_out, max_out], dim=1)
+
+        x = self.conv(x)
+
+        return self.sigmoid(x)
+
+
+class CBAM(nn.Module):
+
+    def __init__(self, channels):
+
+        super(CBAM, self).__init__()
+
+        self.ca = ChannelAttention(channels)
+        self.sa = SpatialAttention()
+
+    def forward(self, x):
+
+        x = x * self.ca(x)
+
+        x = x * self.sa(x)
+
+        return x
 class Block(nn.Module):
     r""" ConvNeXt Block. There are two equivalent implementations:
     (1) DwConv -> LayerNorm (channels_first) -> 1x1 Conv -> GELU -> 1x1 Conv; all in (N, C, H, W)
@@ -30,6 +103,7 @@ class Block(nn.Module):
         self.pwconv1 = nn.Linear(dim, 4 * dim) # pointwise/1x1 convs, implemented with linear layers
         self.act = nn.GELU()
         self.pwconv2 = nn.Linear(4 * dim, dim)
+        self.cbam = CBAM(dim)
         self.gamma = nn.Parameter(layer_scale_init_value * torch.ones((dim)), 
                                     requires_grad=True) if layer_scale_init_value > 0 else None
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -42,6 +116,9 @@ class Block(nn.Module):
         x = self.pwconv1(x)
         x = self.act(x)
         x = self.pwconv2(x)
+        x = x.permute(0, 3, 1, 2)
+        x = self.cbam(x)
+        x = x.permute(0, 2, 3, 1)
         if self.gamma is not None:
             x = self.gamma * x
         x = x.permute(0, 3, 1, 2) # (N, H, W, C) -> (N, C, H, W)
@@ -103,7 +180,10 @@ class ConvNeXt(nn.Module):
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv2d, nn.Linear)):
             trunc_normal_(m.weight, std=.02)
+        try:
             nn.init.constant_(m.bias, 0)
+        except:
+            pass
 
     def forward_features(self, x):
         for i in range(4):
